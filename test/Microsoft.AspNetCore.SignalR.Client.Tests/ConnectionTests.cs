@@ -465,7 +465,6 @@ namespace Microsoft.AspNetCore.Sockets.Client.Tests
                     return Task.CompletedTask;
                 });
 
-
             var blockReceiveCallbackTcs = new TaskCompletionSource<object>();
             var closedTcs = new TaskCompletionSource<object>();
 
@@ -517,7 +516,6 @@ namespace Microsoft.AspNetCore.Sockets.Client.Tests
                     channel.Out.TryComplete();
                     return Task.CompletedTask;
                 });
-
 
             var callbackInvokedTcs = new TaskCompletionSource<object>();
             var closedTcs = new TaskCompletionSource<object>();
