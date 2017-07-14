@@ -22,6 +22,7 @@ namespace SocketsSample
                 .ConfigureLogging(factory =>
                 {
                     factory.AddConsole();
+                    factory.SetMinimumLevel(LogLevel.Trace);
                 })
                 .UseKestrel()
                 .UseContentRoot(Directory.GetCurrentDirectory())

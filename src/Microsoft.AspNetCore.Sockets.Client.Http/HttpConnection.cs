@@ -118,19 +118,21 @@ namespace Microsoft.AspNetCore.Sockets.Client
             {
                 var negotiationResponse = await Negotiate(Url, _httpClient, _logger);
                 _connectionId = negotiationResponse.ConnectionId;
-
-                // Connection is being stopped while start was in progress
-                if (_connectionState == ConnectionState.Disconnected)
+                using (_logger.BeginScope(new ConnectionLogScope(_connectionId)))
                 {
-                    _logger.HttpConnectionClosed(_connectionId);
-                    return;
+                    // Connection is being stopped while start was in progress
+                    if (_connectionState == ConnectionState.Disconnected)
+                    {
+                        _logger.HttpConnectionClosed(_connectionId);
+                        return;
+                    }
+
+                    _transport = _transportFactory.CreateTransport(GetAvailableServerTransports(negotiationResponse));
+
+                    var connectUrl = CreateConnectUrl(Url, negotiationResponse);
+                    _logger.StartingTransport(_connectionId, _transport.GetType().Name, connectUrl);
+                    await StartTransport(connectUrl);
                 }
-
-                _transport = _transportFactory.CreateTransport(GetAvailableServerTransports(negotiationResponse));
-
-                var connectUrl = CreateConnectUrl(Url, negotiationResponse);
-                _logger.StartingTransport(_connectionId, _transport.GetType().Name, connectUrl);
-                await StartTransport(connectUrl);
             }
             catch
             {
@@ -266,130 +268,142 @@ namespace Microsoft.AspNetCore.Sockets.Client
             }
             catch (Exception ex)
             {
-                _logger.ErrorStartingTransport(_connectionId, _transport.GetType().Name, ex);
+                using (_logger.BeginScope(new ConnectionLogScope(_connectionId)))
+                {
+                    _logger.ErrorStartingTransport(_connectionId, _transport.GetType().Name, ex);
+                }
                 throw;
             }
         }
 
         private async Task ReceiveAsync()
         {
-            try
+            using (_logger.BeginScope(new ConnectionLogScope(_connectionId)))
             {
-                _logger.HttpReceiveStarted(_connectionId);
-
-                while (await Input.WaitToReadAsync())
+                try
                 {
-                    if (_connectionState != ConnectionState.Connected)
-                    {
-                        _logger.SkipRaisingReceiveEvent(_connectionId);
-                        // drain
-                        Input.TryRead(out _);
-                        continue;
-                    }
+                    _logger.HttpReceiveStarted(_connectionId);
 
-                    if (Input.TryRead(out var buffer))
+                    while (await Input.WaitToReadAsync())
                     {
-                        _logger.ScheduleReceiveEvent(_connectionId);
-                        _ = _eventQueue.Enqueue(() =>
+                        if (_connectionState != ConnectionState.Connected)
                         {
-                            _logger.RaiseReceiveEvent(_connectionId);
+                            _logger.SkipRaisingReceiveEvent(_connectionId);
+                            // drain
+                            Input.TryRead(out _);
+                            continue;
+                        }
 
-                            // Making a copy of the Received handler to ensure that its not null
-                            // Can't use the ? operator because we specifically want to check if the handler is null
-                            var receivedHandler = Received;
-                            if (receivedHandler != null)
+                        if (Input.TryRead(out var buffer))
+                        {
+                            _logger.ScheduleReceiveEvent(_connectionId);
+                            _ = _eventQueue.Enqueue(() =>
                             {
-                                return receivedHandler(buffer);
-                            }
+                                _logger.RaiseReceiveEvent(_connectionId);
 
-                            return Task.CompletedTask;
-                        });
+                                // Making a copy of the Received handler to ensure that its not null
+                                // Can't use the ? operator because we specifically want to check if the handler is null
+                                var receivedHandler = Received;
+                                if (receivedHandler != null)
+                                {
+                                    return receivedHandler(buffer);
+                                }
+
+                                return Task.CompletedTask;
+                            });
+                        }
+                        else
+                        {
+                            _logger.FailedReadingMessage(_connectionId);
+                        }
                     }
-                    else
-                    {
-                        _logger.FailedReadingMessage(_connectionId);
-                    }
+
+                    await Input.Completion;
+                }
+                catch (Exception ex)
+                {
+                    Output.TryComplete(ex);
+                    _logger.ErrorReceiving(_connectionId, ex);
                 }
 
-                await Input.Completion;
+                _logger.EndReceive(_connectionId);
             }
-            catch (Exception ex)
-            {
-                Output.TryComplete(ex);
-                _logger.ErrorReceiving(_connectionId, ex);
-            }
-
-            _logger.EndReceive(_connectionId);
         }
 
         public async Task SendAsync(byte[] data, CancellationToken cancellationToken = default(CancellationToken))
         {
-            if (data == null)
+            using (_logger.BeginScope(new ConnectionLogScope(_connectionId)))
             {
-                throw new ArgumentNullException(nameof(data));
-            }
-
-            if (_connectionState != ConnectionState.Connected)
-            {
-                throw new InvalidOperationException(
-                    "Cannot send messages when the connection is not in the Connected state.");
-            }
-
-            // TaskCreationOptions.RunContinuationsAsynchronously ensures that continuations awaiting
-            // SendAsync (i.e. user's code) are not running on the same thread as the code that sets
-            // TaskCompletionSource result. This way we prevent from user's code blocking our channel
-            // send loop.
-            var sendTcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var message = new SendMessage(data, sendTcs);
-
-            _logger.SendingMessage(_connectionId);
-
-            while (await Output.WaitToWriteAsync(cancellationToken))
-            {
-                if (Output.TryWrite(message))
+                if (data == null)
                 {
-                    await sendTcs.Task;
-                    break;
+                    throw new ArgumentNullException(nameof(data));
+                }
+
+                if (_connectionState != ConnectionState.Connected)
+                {
+                    throw new InvalidOperationException(
+                        "Cannot send messages when the connection is not in the Connected state.");
+                }
+
+                // TaskCreationOptions.RunContinuationsAsynchronously ensures that continuations awaiting
+                // SendAsync (i.e. user's code) are not running on the same thread as the code that sets
+                // TaskCompletionSource result. This way we prevent from user's code blocking our channel
+                // send loop.
+                var sendTcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var message = new SendMessage(data, sendTcs);
+
+                _logger.SendingMessage(_connectionId);
+
+                while (await Output.WaitToWriteAsync(cancellationToken))
+                {
+                    if (Output.TryWrite(message))
+                    {
+                        await sendTcs.Task;
+                        break;
+                    }
                 }
             }
         }
 
         public async Task DisposeAsync()
         {
-            _logger.StoppingClient(_connectionId);
-
-            if (Interlocked.Exchange(ref _connectionState, ConnectionState.Disconnected) == ConnectionState.Initial)
+            using (_logger.BeginScope(new ConnectionLogScope(_connectionId)))
             {
-                // the connection was never started so there is nothing to clean up
-                return;
-            }
+                _logger.StoppingClient(_connectionId);
 
-            try
-            {
-                await _startTcs.Task;
-            }
-            catch
-            {
-                // We only await the start task to make sure that StartAsync completed. The
-                // _startTask is returned to the user and they should handle exceptions.
-            }
+                if (Interlocked.Exchange(ref _connectionState, ConnectionState.Disconnected) == ConnectionState.Initial)
+                {
+                    // the connection was never started so there is nothing to clean up
+                    return;
+                }
 
-            if (_transportChannel != null)
-            {
-                Output.TryComplete();
-            }
+                try
+                {
+                    await _startTcs.Task;
+                }
+                catch
+                {
+                    // We only await the start task to make sure that StartAsync completed. The
+                    // _startTask is returned to the user and they should handle exceptions.
+                }
 
-            if (_transport != null)
-            {
-                await _transport.StopAsync();
-            }
+                if (_transportChannel != null)
+                {
+                    Output.TryComplete();
+                }
 
-            if (_receiveLoopTask != null)
-            {
-                await _receiveLoopTask;
-            }
+                if (_transport != null)
+                {
+                    await _transport.StopAsync();
+                }
 
-            _httpClient.Dispose();
+                if (_receiveLoopTask != null)
+                {
+                    await _receiveLoopTask;
+                }
+
+                _httpClient.Dispose();
+            }
         }
 
         private class ConnectionState
